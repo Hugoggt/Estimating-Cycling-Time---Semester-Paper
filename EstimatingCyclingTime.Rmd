@@ -1,0 +1,903 @@
+---
+title: "EstimatingCyclingTime"
+author: "Hugo"
+date: "2024-03-18"
+output: html_document
+---
+
+## Import Libraries
+
+
+```{r setup, include=FALSE}
+#java -Xmx128M -Xms128M -Xmn8M -DmaxRunningTime=300 -cp brouter-1.6.3_brouterR-all.jar btools.server.RouteServer segments4 profiles2 customprofiles 17777 5 127.0.0.1
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE, echo = FALSE, results='hide', message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(RColorBrewer)
+library(devtools)
+library(brouterR)
+library(patchwork)
+library(sf)
+library(lmtest)
+library(tseries)
+library(sp)
+library(wkb)
+library(car)
+
+library(dplyr)
+library(randomForest)
+library(e1071)
+library(caret)
+library(MASS)
+library(nortest)
+library(xgboost)
+
+```
+
+
+
+
+## Create Dataset
+
+Only run this section to create the dataset trips.
+
+```{r, echo = FALSE}
+########### Extract Routes functions ###########################################
+
+startServers <- function(pathToBRouter=NULL, noServers=1) {
+  oldwd <- getwd()
+  setwd(pathToBRouter)
+  system("./wscript.sh")
+  setwd(oldwd)
+  print("--Servers started")
+}
+
+
+extract_stages<- function(coordinates_df) {
+  calculate_route <- function(start_lat, start_lon, end_lat, end_lon) {
+    tryCatch({
+      route <- brouterR::calculateRoute(startLat = start_lat, startLon = start_lon,
+                                         endLat = end_lat, endLon = end_lon)
+      return(route)
+    }, error = function(e) {
+      message("Error in calculating route: ", e$message)
+      return(NULL)
+    })
+  }
+  total_route <- NULL
+  for (i in 1:(nrow(coordinates_df) - 1)) {
+    start_lat <- coordinates_df$Y_start[i]
+    start_lon <- coordinates_df$X_start[i]
+    end_lat <- coordinates_df$Y_end[i]
+    end_lon <- coordinates_df$X_end[i]
+    stage_route <- calculate_route(start_lat, start_lon, end_lat, end_lon)
+    if (!is.null(stage_route)) {
+      stage_route_df <- as.data.frame(stage_route)
+      total_route <- rbind(total_route, stage_route_df)
+    }
+  }
+  return(total_route)
+}
+
+
+extract_stages_linestring<- function(coordinates_df) {
+  calculate_route <- function(start_lat, start_lon, end_lat, end_lon) {
+    tryCatch({
+      route <- brouterR::calculateRoute(startLat = start_lat, startLon = start_lon,
+                                         endLat = end_lat, endLon = end_lon, outputFormat = "linestring")
+      return(route)
+    }, error = function(e) {
+      message("Error in calculating route: ", e$message)
+      return(NULL)
+    })
+  }
+  #total_route <- NULL
+  empty_coords <- matrix(numeric(0), ncol = 2)
+  total_route <- st_linestring(empty_coords)
+
+  for (i in 1:(nrow(coordinates_df) - 1)) {
+    start_lat <- coordinates_df$Y_start[i]
+    start_lon <- coordinates_df$X_start[i]
+    end_lat <- coordinates_df$Y_end[i]
+    end_lon <- coordinates_df$X_end[i]
+    stage_route <- calculate_route(start_lat, start_lon, end_lat, end_lon)
+    if (!is.null(stage_route)) {
+      print(stage_route)
+      multiline <- st_multilinestring(list(total_route, stage_route))
+
+    }
+  }
+  return(total_route)
+}
+
+extract_coords <- function(point_string) {
+  coords <- gsub("POINT \\((.*) (.*)\\)", "\\1 \\2", point_string)
+  coords <- unlist(strsplit(coords, " "))
+  return(as.numeric(coords))
+}
+
+create_coords <- function(geom){
+  s <- hex2raw(geom)
+  wkb <- structure(list(s), class = "WKB")
+  obj <- st_as_sfc(wkb, EWKB = TRUE)
+  coords <- st_coordinates(obj)
+  coords <- data.frame(X = coords[, 1], Y = coords[, 2])
+  return(coords)
+
+}
+
+select_rows <- function(coords, interval) {
+  interval <- min(interval, ceiling(nrow(coords) / 10))
+  result <- coords[1, ]
+  if (nrow(coords)>=3){
+    middle_indices <- seq(from = interval + 1, to = nrow(coords) - 1, by = interval)
+    result <- rbind(result, coords[middle_indices, ])
+  }
+  result <- rbind(result, coords[nrow(coords), ])
+  result <- data.frame(
+  X_start = result$X[-nrow(result)],  
+  Y_start = result$Y[-nrow(result)],  
+  X_end = result$X[-1],               
+  Y_end = result$Y[-1]
+  )
+  result <- result[-c(1, nrow(result)), ]
+  return(result)
+}
+
+
+
+
+
+
+
+########### Route statistics functions #########################################
+
+
+calculate_speed <- function(duration_seconds, length_meters) {
+  duration_hours <- duration_seconds   / 3600 
+  length_kilometers <- length_meters / 1000    
+  speed_kmh <- length_kilometers / duration_hours
+  return( speed_kmh)
+}
+
+calculate_BMI <- function(weight, height) {
+  height_m <- height / 100
+  BMI <- weight / (height_m^2)
+  return( BMI)
+}
+
+estimate_power <-function(age, gender, sport, height, weight){
+  FreiPhysActWeek <- ifelse(sport %in% c(2,3,4,5), 180,
+                     ifelse(sport %in% c(1), 90, 75))
+  pass <- ifelse(sport %in% c(5,6,7), 8,
+           ifelse(sport %in% c(2,3,4), 6,
+           ifelse(sport %in% c(1), 4, 2)))
+  SexFormula <- ifelse(gender=="Male",1,ifelse(gender=="Female",0,NA))
+  BMI <- 10*height/weight
+  VO2max <- 57.402-0.372*age+8.596*SexFormula+1.396*pass-0.683*BMI
+  O <- (VO2max*weight)/10
+  b <- BMI*50/25
+  l <- ifelse(BMI<19 | BMI>30, 0.48,
+        ifelse((BMI<=30 & BMI>25) & FreiPhysActWeek<=75, 0.55,
+          ifelse((BMI<=25 & BMI>19) & FreiPhysActWeek<=75,0.55,
+            ifelse((BMI<=30 & BMI>19) & FreiPhysActWeek<180 & FreiPhysActWeek>75, 0.6,
+              ifelse((BMI<=30 & BMI>25) & FreiPhysActWeek>=180, 0.6,
+                ifelse((BMI<=25 & BMI>=19) & FreiPhysActWeek>=180,0.7,NA))))))
+  a <- (O*l)
+  W <- a-b
+  return(W)
+}
+
+
+calculate_Elevations <- function(route_data) {
+  if (is.list(route_data)){
+  route_data <- do.call(data.frame, route_data)
+  }
+  if(length(route_data$Distance) < 2) {
+    return(list(
+    elevation_difference_first_last = NA,
+    elevation_difference_min_max = NA,
+    total_ascent = NA,
+    total_descent = NA,
+    max_steepness = NA,
+    min_steepness = NA,
+    avg_steepness = NA
+  ))
+  } else {
+  route_data <- route_data[complete.cases(route_data$Elevation, route_data$Distance), ]
+  elevation_diff <- c(0, diff(route_data$Elevation))
+  total_ascent <- sum(elevation_diff[elevation_diff > 0])
+  total_descent <- sum(abs(elevation_diff[elevation_diff < 0]))
+  elevation_difference_first_last <- route_data$Elevation[nrow(route_data)] - route_data$Elevation[1]
+  elevation_difference_min_max <- max(route_data$Elevation) - min(route_data$Elevation)
+  total_distance <- 0
+  total_elevation_change <- 0
+  avg_steepness <- 0
+  max_steepness <- -Inf
+  min_steepness <- Inf
+  for (i in 1:(nrow(route_data) - 1)) {
+    elevation_change <- route_data$Elevation[i + 1] - route_data$Elevation[i]
+    total_distance <- total_distance + route_data$Distance[i]
+    total_elevation_change <- total_elevation_change + abs(elevation_change)
+      if (route_data$Distance[i] != 0) {
+      steepness <- elevation_change / route_data$Distance[i]
+        max_steepness <- max(max_steepness, steepness)
+        min_steepness <- min(min_steepness, steepness)
+        avg_steepness <- avg_steepness + route_data$Distance[i] * steepness
+    }
+  }
+  avg_steepness <- avg_steepness / total_distance
+  return(list(
+    elevation_difference_first_last = elevation_difference_first_last,
+    elevation_difference_min_max = elevation_difference_min_max,
+    total_ascent = total_ascent,
+    total_descent = total_descent,
+    max_steepness = max_steepness,
+    min_steepness = min_steepness,
+    avg_steepness = avg_steepness
+  ))
+}
+}
+
+
+calculate_route_features <- function(route_data){
+  if (is.list(route_data)){
+  route_data <- do.call(data.frame, route_data)
+  }
+  if(is.null(nrow(route_data))) {
+    return(list(
+    num_traffic_signals = NA,
+    num_crossing = NA,
+    cycleway_percentage = NA,
+    oneway_percentage = NA,
+    most_covered_highway = NA
+    
+  ))
+  } else {
+  num_traffic_signals <- sum(grepl("crossing=traffic_signals", route_data$NodeTags))
+  num_crossing <- sum(grepl("highway=crossing", route_data$NodeTags))
+  total_distance <- sum(route_data$Distance)
+  cycleway_distance <- sum(route_data$Distance[grepl("cycleway=lane", route_data$WayTags)])
+  cycleway_percentage <- (cycleway_distance / total_distance) * 100
+  oneway_distance <- sum(route_data$Distance[grep("oneway=yes", route_data$WayTags)])
+  oneway_percentage <- (oneway_distance / total_distance) * 100
+  highway_types <- gsub(".*highway=([^ ]+).*", "\\1", route_data$WayTags)
+  highway_distances <- tapply(route_data$Distance, highway_types, sum)
+  most_covered_highway <- names(which.max(highway_distances))
+  return(list(
+    num_traffic_signals = num_traffic_signals,
+    num_crossing = num_crossing,
+    cycleway_percentage = cycleway_percentage,
+    oneway_percentage = oneway_percentage,
+    most_covered_highway = most_covered_highway
+  ))
+  }
+}
+
+```
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+
+################ Create the Dataset ############################################
+
+trips <- subset(stages_rct_geometry, detected_mode %in% c("Mode::Bicycle", "Mode::Ebicycle"))
+trips <- trips[trips$started_at_timezone == "Europe/Zurich", ]
+trips <- trips[complete.cases(trips$geometry),]
+geoms <- trips$geometry
+coords <- lapply(geoms, create_coords)
+coords <- lapply(coords, select_rows, interval = 10)
+routes <- lapply(coords, extract_stages)
+
+
+
+# Calculate Elevation stats
+stats <- lapply(routes, calculate_Elevations)
+elevation_difference <- sapply(stats, function(x) x$elevation_difference_first_last)
+elevation_difference_min_max <- sapply(stats, function(x) x$elevation_difference_min_max)
+total_ascent <- sapply(stats, function(x) x$total_ascent)
+total_descent <- sapply(stats, function(x) x$total_descent)
+max_steepness <- sapply(stats, function(x) x$max_steepness)
+min_steepness <- sapply(stats, function(x) x$min_steepness)
+avg_steepness <- sapply(stats, function(x) x$avg_steepness)
+trips$elevation_difference_start_end <- elevation_difference
+trips$elevation_difference_min_max <- elevation_difference_min_max
+trips$total_ascent <- total_ascent
+trips$total_descent <- total_descent
+trips$max_steepness <- max_steepness
+trips$min_steepness <- min_steepness
+trips$avg_steepness <- avg_steepness
+
+
+# Calculate  Route stats
+stats <- lapply(routes, calculate_route_features)
+num_traffic_signals <- sapply(stats, function(x) x$num_traffic_signals)
+num_traffic_signals <- sapply(num_traffic_signals, function(x) {if (is.numeric(x)) {as.numeric(x)} else {NA}})
+
+num_crossing <- sapply(stats, function(x) x$num_crossing)
+num_crossing <- sapply(num_crossing, function(x) {if (is.numeric(x)) {as.numeric(x)} else {NA}})
+
+cycleway_percentage <- sapply(stats, function(x) x$cycleway_percentage)
+cycleway_percentage <- sapply(cycleway_percentage, function(x) {if (is.numeric(x)) {as.numeric(x)} else {NA}})
+oneway_percentage <- sapply(stats, function(x) x$oneway_percentage)
+oneway_percentage <- sapply(oneway_percentage, function(x) {if (is.numeric(x)) {as.numeric(x)} else {NA}})
+most_covered_highway <- sapply(stats, function(x) x$most_covered_highway)
+most_covered_highway <- sapply(stats, function(x) {if (length(x$most_covered_highway) > 0) {unlist(x$most_covered_highway)} else {NA}})
+trips$num_traffic_signals <- num_traffic_signals
+trips$num_crossing <- num_crossing
+trips$cycleway_percentage <- cycleway_percentage
+trips$oneway_percentage <- oneway_percentage
+trips$most_covered_highway <- most_covered_highway
+trips <- trips[!grepl("=", trips$most_covered_highway), ]
+
+
+
+trips <- trips[, c("stage_id", "user_id", "geometry", "length", "duration", "avg_speed", "detected_mode", "elevation_difference_start_end","elevation_difference_min_max", "max_steepness", "min_steepness", "avg_steepness", "total_ascent", "total_descent", "num_traffic_signals", "num_crossing", "cycleway_percentage", "oneway_percentage" ,"most_covered_highway")]
+colnames(trips)[colnames(trips) == "avg_speed"] <- "speed"
+trips <- subset(trips, speed <= 100)
+trips <- subset(trips, elevation_difference_min_max <= 5000)
+trips$length <- trips$length / 1000
+Intro <- EBIS_Intro_survey_cleaned_labelled_20231010[,c("user_id", "age", "gender", "wght_height_1", "wght_height_2", "own_bike_types_1", "own_bike_types_2", "own_bike_types_3")]
+trips <- merge(trips, Intro, by = "user_id", all.x = TRUE)
+Final <- final_fini[,c("user_id",  "pa_intense_days", "health_status")]
+trips <- merge(trips, Final, by = "user_id", all.x = TRUE)
+trips$BMI <- calculate_BMI(trips$wght_height_1, trips$wght_height_2)
+trips <- subset(trips, BMI <= 70)
+trips$age_group <- cut(trips$age, breaks = seq(0, max(trips$age) + 5, by = 5), labels = seq(0, max(trips$age), by = 5))
+trips$BMI_group <- round(trips$BMI)
+trips$estimated_power <- estimate_power(trips$age, trips$gender, trips$pa_intense_days, trips$wght_height_1, trips$wght_height_2)
+trips$health_status[trips$health_status == "Poor"] <- "Fair"
+
+trips$own_bike_types_1[trips$own_bike_types_1 != "No"] <- "Yes"
+trips$own_bike_types_2[trips$own_bike_types_2 != "No"] <- "Yes"
+trips$own_bike_types_3[trips$own_bike_types_3 != "No"] <- "Yes"
+
+trips$detected_mode <- ifelse(trips$detected_mode == "Mode::Bicycle", "Bike",
+                             ifelse(trips$detected_mode == "Mode::Ebicycle" & trips$own_bike_types_2 == "Yes", "Pedelec", "Spedelec"))
+
+
+#write.csv(trips, "C:\\Users\\user\\Documents\\ETHZ\\MA4\\Estimating cycling travel times accounting for individual capabilites\\RCode_Estimating_Cycling_Time\\Tracking Data\\trips.csv", row.names = FALSE)
+
+```
+
+
+## Load Dataset
+
+Here the trips dataset can be directly loaded
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+############## Load the Dataset ################################################
+
+trips <- read.csv("C:\\Users\\user\\Documents\\ETHZ\\MA4\\Estimating cycling travel times accounting for individual capabilites\\RCode_Estimating_Cycling_Time\\Tracking Data\\trips.csv")
+trips <- trips[complete.cases(trips), ]
+
+#na.omit(trips)
+lookup_table <- c("Excellent", "Very good", "Good", "Fair")
+trips$health_status <- lookup_table[trips$health_status]
+
+
+table_Bike <- subset(trips, detected_mode == "Bike")
+table_Ebike <- subset(trips, detected_mode %in% c("Spedelec", "Pedelec"))
+table_Pedelec <- subset(trips, detected_mode == "Pedelec")
+table_Spedelec <- subset(trips, detected_mode == "Spedelec")
+
+```
+
+
+## Plots 
+
+### Transport mode
+
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+combined_table <- data.frame(
+  speed = c(table_Bike$speed, table_Spedelec$speed, table_Pedelec$speed),
+  type = factor(rep(c("Bike", "Spedelec", "Pedelec"), c(nrow(table_Bike), nrow(table_Spedelec), nrow(table_Pedelec))))
+)
+
+colorblind_palette <- c("Bike" = "#E69F00", "Spedelec" = "#56B4E9", "Pedelec" = "#CC79A7")
+median(table_Bike$speed)
+median(table_Pedelec$speed)
+median(table_Spedelec$speed)
+
+
+ggplot(combined_table, aes(x = type, y = speed, fill = type)) +
+  geom_boxplot() +
+  scale_fill_manual(values = colorblind_palette) +
+  labs(#title = "Distribution of Trip Speed",
+       x = "Type of Vehicle",
+       y = "length (km)")
+
+ 
+
+combined_data <- rbind(transform(table_Bike, type = "Bike"), transform(table_Spedelec, type = "Spedelec"),  transform(table_Pedelec, type = "Pedelec"))
+
+ggplot(combined_data, aes(x = BMI, y = speed, color = type, group = type)) +
+  geom_smooth(method = "loess", se = FALSE, size = 1) + 
+  scale_color_manual(values = colorblind_palette) +
+  labs(
+     title = "Smoothed speed vs BMI",
+    x = "BMI",
+    y = "Speed (km/h)"
+  ) + xlim(17,37)
+
+```
+
+### Gender
+
+
+
+
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+p1 <- ggplot(table_Bike, aes(x = factor(gender), y = speed, fill = gender)) + 
+  geom_boxplot() + 
+  scale_fill_viridis_d() +
+  labs(title = "Bike",
+       x = "Gender", y = "Speed (km/h)")
+
+p2 <- ggplot(table_Ebike, aes(x = factor(gender), y = speed, fill = gender)) + 
+  geom_boxplot() + 
+  scale_fill_viridis_d() +
+  labs(title = "Ebike",
+       x = "Gender", y = "Speed (km/h)")
+
+
+
+combined_plot <- p1 + p2 + plot_layout(ncol = 2) + 
+  plot_annotation(title = "Speed Distribution by Gender",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+print(combined_plot)
+```
+
+### Age
+
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+p1 <- ggplot(table_Bike, aes(x = age_group)) + 
+  geom_bar(aes(y = ..count..), stat = "count") +  
+  labs(title = "Bike", x = "Age Group", y = "Count")
+p2 <- ggplot(table_Ebike, aes(x = age_group)) + 
+  geom_bar(aes(y = ..count..), stat = "count") +  
+  labs(title = "Bike", x = "Age Group", y = "Count")
+combined_plot <- p1 + p2 + plot_layout(ncol = 2) + 
+  plot_annotation(title = "Age distribution",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+print(combined_plot)
+
+
+
+
+p1 <- ggplot(table_Bike, aes(x = factor(age_group), y = speed, fill = factor(age_group))) +
+  geom_boxplot(show.legend = FALSE) + 
+  labs(title = "Bike", x = NULL, y = "duration(h)") +
+  scale_fill_viridis_d(name = "Age group")  
+p2 <- ggplot(table_Spedelec, aes(x = factor(age_group), y = speed, fill = factor(age_group))) +
+  geom_boxplot(show.legend = TRUE) + 
+  labs(title = "Spedelec", x = NULL, y = "duration (h)") +
+  scale_fill_viridis_d(name = "Age group")  
+p3 <- ggplot(table_Pedelec, aes(x = factor(age_group), y = speed, fill = factor(age_group))) +
+  geom_boxplot(show.legend = TRUE) + 
+  labs(title = "Pedelec", x = NULL, y = "duration (h)") +
+  scale_fill_viridis_d(name = "Age group")  
+combined_plot <- p1 + p2 + p3 +plot_layout(ncol = 3) + 
+  plot_annotation(title = "Speed distribution by Age Group (5-Year Tranches) and Bike type",
+                  theme = theme(plot.title = element_text(hjust = 0.5))) +
+  theme(axis.text.x = element_blank(),  
+        legend.position = "right") 
+print(combined_plot)
+
+```
+
+
+### BMI
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+table_Bike_filtered <- subset(table_Bike, BMI >= 10 & BMI <= 50)
+ggplot(table_Bike_filtered, aes(x = BMI, fill = ..count..)) + 
+  geom_histogram(binwidth = 1, color = "black") + 
+  scale_fill_viridis_c() +
+  labs(title = "Distribution of BMI (10-50)", x = "BMI", y = "Count")
+
+ggplot(table_Bike, aes(x = factor(BMI_group), y = duration, fill = factor(BMI_group))) +
+  geom_boxplot() +
+  scale_fill_viridis_d() +
+  labs(title = "distance Distribution by BMI Group",
+       x = "BMI Group", y = "Distance (km)")
+
+avg_bmi <- aggregate(BMI ~ health_status, data = table_Bike, FUN = mean)
+print(avg_bmi)
+```
+
+### Health
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+p1 <- ggplot(table_Bike, aes(x = "", fill = health_status)) +
+  geom_bar(width = 1, color = "white") + 
+  coord_polar("y", start = 0) +
+  scale_fill_viridis_d() +  
+  theme_void() +
+  labs(title = "Bike")
+p2 <- ggplot(table_Ebike, aes(x = "", fill = health_status)) +
+  geom_bar(width = 1, color = "white") + 
+  coord_polar("y", start = 0) +
+  scale_fill_viridis_d() +  
+  theme_void() +
+  labs(title = "Ebike")
+combined_plot <- p1 + p2 + plot_layout(ncol = 2) + 
+  plot_annotation(title = "Health Status Distribution by Bike type",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+print(combined_plot)
+
+
+table_Bike <- na.omit(table_Bike)
+p1 <- ggplot(table_Bike, aes(x = health_status, y = duration, fill = health_status)) +
+  geom_boxplot() +
+  scale_fill_viridis_d() +  ylim(0,0.5) +
+  labs(title = "Bike", x = "Health Status", y = "duration(h)" )
+p2 <- ggplot(table_Ebike, aes(x = health_status, y = duration, fill = health_status)) +
+  geom_boxplot() +
+  scale_fill_viridis_d() +  ylim(0,0.5) +
+  labs(title = "Ebike", x = "Health Status", y = "duration(h)" )
+combined_plot <- p1 + p2 + plot_layout(ncol = 2) + 
+  plot_annotation(#title = "Duration Distribution by Health status and Bike type",
+                  theme = theme(plot.title = element_text(hjust = 0.5)))
+
+print(combined_plot)
+
+
+print(tapply(table_Bike$duration, table_Bike$health_status, median, na.rm = TRUE))
+```
+
+### Trips Elevation
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+
+bike_color <- "#0072B2" 
+ebike_color <- "#E69F00" 
+combined_data <- rbind(transform(table_Bike, type = "Bike"), transform(table_Ebike, type = "Ebike"))
+
+
+ggplot(combined_data, aes(x = num_crossing, y = duration , color = type)) +
+  geom_point() +
+  scale_color_manual(values = c("Bike" = "#E69F00", "Ebike" = "#56B4E9")) +
+  labs(title = "Duration vs Distance for Bike and Ebike",
+       x = "Duration (h)",
+       y = "Positive Elevation (m)")
+
+```
+
+## Models
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+update_table <- function(table){
+  cols_to_drop <- c("X","stage_id", "geometry", "detected_mode", "user_id", "age_group", "BMI_group","wght_height_1", "wght_height_2",     "motivation_1", "motivation_2", "speed", "home_postcode_nr", "age", "gender", "total_descent", "elevation_difference_start_end","elevation_difference_min_max", "own_bike_types_1", "own_bike_types_2", "own_bike_types_3")
+  table <- table[, !names(table) %in% cols_to_drop]
+  table <- table[complete.cases(table), ]
+  
+  #table$num_crossing <- table$num_crossing + table$num_traffic_signals
+  table$duration <- pmax(table$duration*3600, 1)
+  table$duration <- log(table$duration)
+  table$length <- log(table$length * 1000)
+  table$total_ascent <- log(table$total_ascent)
+  table$total_ascent <- pmax(table$total_ascent, 0)
+  table$estimated_power <- log(table$estimated_power)
+  table$estimated_power <- pmax(table$estimated_power, 0)
+  table$num_traffic_signals <- log(table$num_traffic_signals)
+  table$num_traffic_signals <- pmax(table$num_traffic_signals, 1)
+  table$num_crossing <- pmax(table$num_crossing, 1)
+  table$num_crossing <- log(table$num_crossing)
+  table$BMI <- log(table$BMI)
+  table$BMI <- pmax(table$BMI, 0)
+  table$avg_steepness <- sign(table$avg_steepness) * log(pmax(abs(table$avg_steepness)*100, 1))
+  table$max_steepness <- pmax(table$max_steepness*100, 1)
+  table$max_steepness <- log(table$max_steepness)
+  table$pa_intense_days <- as.numeric(table$pa_intense_days)
+
+ 
+  return(table)
+  
+}
+
+
+table_Bike <- update_table(table_Bike)
+table_Ebike <- update_table(table_Ebike)
+
+
+```
+
+
+### Linear Models
+
+#### assumptions
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+assumptions <- function(table){
+
+  table <- table[, !names(table) %in% c("elevation_difference_min_max")]
+  table$most_covered_highway <- factor(table$most_covered_highway, levels = unique(table$most_covered_highway))
+  table$most_covered_highway <- relevel(table$most_covered_highway, ref = "residential")
+
+  #Model
+  lm_model <- lm(duration ~., data = table)
+  numeric_vars <- sapply(table, is.numeric)
+  numeric_vars <- table[, !names(table) %in% c("speed")]
+  residuals <- residuals(lm_model)
+
+  #Multicollinearity
+  print(vif(lm_model))
+  
+  #Non Constant Variance
+  plot(lm_model$fitted.values, resid(lm_model), xlab = "Fitted values", ylab = "Residuals", main = "Fitted vs Residuals")
+  abline(a = 0, b = 0, col = "#009E73" )
+  print(ncvTest(lm_model))
+  
+  # Normality of residuals
+  hist(residuals, breaks = 50, main = "Distribution of Residuals", xlab = "Residuals", freq = FALSE)
+  lines(density(residuals), col = "#D55E00")
+  x <- seq(min(residuals), max(residuals), length.out = 100)
+  normal_density <- dnorm(x, mean = mean(residuals), sd = sd(residuals))
+  lines(x, normal_density, col = "#009E73", lty = 2)
+  legend("topright", legend = c("Residuals", "Normal Distribution"), 
+       col = c("#D55E00", "#009E73"), lty = c(1, 2), cex = 0.8)
+  qqPlot(resid(lm_model), main = "QQ Plot of Residuals")
+  # Anderson-Darling test
+  ad.test(resid(lm_model))
+
+}
+
+
+assumptions(table_Bike)
+assumptions(table_Ebike)
+
+
+```
+
+
+#### Ordinary Least Squares
+
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+linear_model <- function(table) {
+
+  table <- table[complete.cases(table),]
+  table <- table[, !names(table) %in% c("trip.id")]
+  table$most_covered_highway <- factor(table$most_covered_highway, levels = unique(table$most_covered_highway))
+  table$most_covered_highway <- relevel(table$most_covered_highway, ref = "residential")
+
+  lm_model <- lm(duration ~ ., data = table)
+  
+  print(summary(lm_model))
+  print(anova(lm_model))
+
+
+}
+
+linear_model(table_Bike)
+linear_model(table_Ebike)
+
+```
+
+
+
+
+#### Test combinations
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+AIC_combinations <- function (table){
+  # Create Interactions Variables
+  table <- table[ , !(names(table) %in% c("health_status", "most_covered_highway"))]
+  simple_covariates <- c("length", "max_steepness", "total_ascent",
+                         "min_steepness", "avg_steepness", 
+                         "num_traffic_signals", "cycleway_percentage",
+                         "oneway_percentage", "pa_intense_days", "BMI", "estimated_power")
+
+  for (i in 1:(length(simple_covariates) - 1)) {
+      covariate1 <- simple_covariates[i]
+      interaction_name <- paste0(covariate1, "_squared")
+      table[[interaction_name]] <- table[[covariate1]]^2 
+  }
+  for (i in 1:(length(simple_covariates) - 1)) {
+      covariate1 <- simple_covariates[i]
+      interaction_name <- paste0(covariate1, "_inversed")
+      table[[interaction_name]] <- 1 / table[[covariate1]]
+  }
+  for (i in 1:(length(simple_covariates) - 1)) {
+    for (j in (i + 1):length(simple_covariates)) {
+      covariate1 <- simple_covariates[i]
+      covariate2 <- simple_covariates[j]
+      interaction_name <- paste0(covariate1, "*", covariate2)
+      table[[interaction_name]] <- table[[covariate1]] * table[[covariate2]]
+    }
+  }
+  table[sapply(table, is.infinite)] <- 0
+  
+  # Model and keep selected variables
+  lm_model <- lm(duration ~ ., data = table)
+  step_model <- stepAIC(lm_model, direction = "both", trace = FALSE)
+
+  
+  selected_vars <- names(step_model$coefficients)[-1] 
+  selected_vars <- c("duration", selected_vars)  
+  selected_vars <- intersect(selected_vars, colnames(table))
+  table <- table[, selected_vars]
+  
+  par(mfrow = c(1, 2)) 
+  qqPlot(resid(step_model), main = "QQ Plot of Residuals")
+  plot(step_model$fitted.values, resid(step_model), xlab = "Fitted values", ylab = "Residuals", main = "Fitted vs Residuals")
+  abline(a = 0, b = 0, col = "#009E73" )
+  
+  print(summary(step_model))
+  print(anova(step_model))
+
+  return(table)
+}
+
+t1 <- table_Bike
+t2 <- table_Ebike
+t1 <- AIC_combinations(t1)
+t2 <- AIC_combinations(t2)
+
+
+```
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+robust_model <- function(table){
+  
+  # Model
+  robust_model <- rlm(duration ~ ., data = table)
+  predictions <- predict(robust_model, newdata = table)
+  
+  # Results
+  explained_variance <- cor(table$duration, predictions)^2
+  cat("Explained Variance (R²):", explained_variance, "\n")
+  residuals <- residuals(robust_model)
+  RSS <- sum(residuals^2)
+  cat("Residual Sum of Squares (RSS):", RSS, "\n")
+  n <- nrow(table)  
+  p <- length(coefficients(robust_model))  
+  RSE <- sqrt(RSS / (n - p))
+  cat("Residual Standard Error (RSE):", RSE, "\n")
+
+
+  plot_data <- data.frame(Fitted = predictions, Residuals = residuals, Duration = table$duration)
+
+  p1 <- ggplot(plot_data, aes(x = Fitted, y = Residuals)) +
+    geom_point() +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    labs(x = "Fitted Values", y = "Residuals") +
+    theme_minimal() +
+    theme(plot.title = element_blank())
+    p2 <- ggplot(plot_data, aes(sample = Residuals)) +
+    stat_qq() +
+    stat_qq_line() +
+    labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal() +
+    theme(plot.title = element_blank())
+  combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+  print(combined_plot)
+
+}
+
+robust_model(table_Bike)
+robust_model(table_Ebike)
+
+```
+
+
+### Non parametric methods
+
+
+#### Random Forest
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+random_forest <- function(table){
+  
+  table <- na.omit(table)
+  
+  # Model
+  predictors <- table[, -which(names(table) == "duration")]
+  response <- table$duration
+  num_trees <- 500 
+  rf_model <- randomForest(x = predictors, y = response, ntree = num_trees)
+  
+  # Results
+  print(rf_model)
+  importance <- importance(rf_model)
+  print(importance)
+  varImpPlot(rf_model)
+  mse <- mean(rf_model$mse)
+  rse <- sqrt(mse)
+  
+  # Print MSE and RSE
+  cat("Mean Squared Error (MSE):", mse, "\n")
+  cat("Residual Standard Error (RSE):", rse, "\n")
+  
+
+  
+
+}
+
+random_forest(table_Bike)
+random_forest(table_Ebike)
+
+```
+
+
+
+
+
+#### XGBoost
+
+```{r, eval = TRUE,  warning = FALSE, message = FALSE}
+
+
+XGboost <- function(table) {
+  # Model
+  set.seed(123)
+  table <- na.omit(table)
+  table$health_status <- as.factor(table$health_status)
+  table$most_covered_highway <- as.factor(table$most_covered_highway)
+  table$health_status <- as.integer(table$health_status)
+  table$most_covered_highway <- as.integer(table$most_covered_highway)
+  predictors <- table[, !names(table) %in% c("duration")]
+  response <- table$duration
+
+  train_index <- sample(1:nrow(table), 0.8 * nrow(table))
+  train_data <- predictors[train_index, ]
+  train_label <- response[train_index]
+  test_data <- predictors[-train_index, ]
+  test_label <- response[-train_index]
+
+  xgb_model <- xgboost(data = as.matrix(train_data), 
+                       label = train_label,
+                       nrounds = 100,         
+                       objective = "reg:squarederror",  
+                       verbose = FALSE)      
+  
+  # Results
+  predictions <- predict(xgb_model, as.matrix(test_data))
+  var_explained <- cor(test_label, predictions)^2 * 100
+  cat("Percentage of Variance Explained:", var_explained, "%\n")
+  
+  residuals <- test_label - predictions
+  RSS <- sum(residuals^2)
+  RSE <- sqrt(RSS / (length(test_label) - ncol(predictors) - 1))
+  cat("Residual Standard Error:", RSE, "\n")
+
+  print(summary(xgb_model))
+  
+  plot(test_label, predictions,
+       xlab = "Observed Speed",
+       ylab = "Predicted Speed",
+       main = "Predicted vs. Observed Speed",
+       pch = 20, col = "#0072B2")
+  abline(0, 1, col = "#E69F00")
+  
+
+  importance_values <- xgb.importance(model = xgb_model)
+  print(importance_values)
+
+}
+
+
+
+
+XGboost(table_Bike)
+XGboost(table_Ebike)
+```
+
